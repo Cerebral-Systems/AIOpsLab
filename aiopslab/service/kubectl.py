@@ -86,6 +86,19 @@ class KubeCtl:
         """Fetch the deployment configuration."""
         return self.apps_v1_api.read_namespaced_deployment(name, namespace)
 
+    @staticmethod
+    def _pod_is_ready_or_succeeded(pod):
+        """Return True when a pod is ready or has completed successfully."""
+        status = getattr(pod, "status", None)
+        if getattr(status, "phase", None) == "Succeeded":
+            return True
+
+        container_statuses = getattr(status, "container_statuses", None)
+        return bool(container_statuses) and all(
+            getattr(container_status, "ready", False)
+            for container_status in container_statuses
+        )
+
     def wait_for_ready(self, namespace, sleep=2, max_wait=300):
         """Wait for all pods in a namespace to be in a Ready state before proceeding."""
 
@@ -102,8 +115,7 @@ class KubeCtl:
                     if pod_list.items:
                         ready_pods = [
                             pod for pod in pod_list.items
-                            if pod.status.container_statuses and
-                            all(cs.ready for cs in pod.status.container_statuses)
+                            if self._pod_is_ready_or_succeeded(pod)
                         ]
 
                         if len(ready_pods) == len(pod_list.items):
