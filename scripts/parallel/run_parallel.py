@@ -137,6 +137,22 @@ def resolve_problems(spec: str) -> "list[str]":
     return valid
 
 
+def shard_problems(problems: "list[str]", n: int) -> "list[list[str]]":
+    """Split a list into n contiguous, near-equal shards (like numpy.array_split).
+
+    Used by --schedule static so cluster i runs a fixed slice, e.g. with 50
+    problems and 2 clusters: shard 0 = problems[0:25] (1-25), shard 1 = [25:50]
+    (26-50). Extra items when len % n != 0 go to the earliest shards.
+    """
+    k, m = divmod(len(problems), n)
+    shards, start = [], 0
+    for i in range(n):
+        size = k + (1 if i < m else 0)
+        shards.append(problems[start:start + size])
+        start += size
+    return shards
+
+
 # --------------------------------------------------------------------------- #
 # Outcome derivation (keys differ across task types)
 # --------------------------------------------------------------------------- #
@@ -275,7 +291,14 @@ def _base_env(cluster, args) -> dict:
 async def worker(cluster, queue: asyncio.Queue, results: list, args, run_dir, state):
     env = _base_env(cluster, args)
 
-    if args.reuse_infra:
+    # In static mode each worker owns a fixed shard, so an empty shard means this
+    # cluster has no work -- don't waste time installing/tearing down infra on it.
+    # In queue mode every cluster may receive any problem, so always set up.
+    has_work = queue.qsize() > 0
+    did_infra = False
+
+    if args.reuse_infra and (args.schedule != "static" or has_work):
+        did_infra = True
         log(f"[cyan]{cluster['name']}[/]: installing shared infra (OpenEBS + Prometheus)…"
             if _console else f"{cluster['name']}: installing shared infra…")
         rc, sentinel, timed_out = await _exec(
@@ -310,7 +333,7 @@ async def worker(cluster, queue: asyncio.Queue, results: list, args, run_dir, st
             f"[{state['done']}/{state['total']}] {pid} {outcome} "
             f"{rec.get('wall', rec.get('duration', 0)):.0f}s")
 
-    if args.reuse_infra and not args.keep_infra:
+    if did_infra and not args.keep_infra:
         await _exec(
             [args.python, str(RUN_ONE), "--teardown-infra"],
             _base_env(cluster, args), args.infra_timeout,
@@ -334,6 +357,7 @@ def write_summary(results, clusters, args, run_dir, wall_clock):
         "agent": args.agent,
         "workers": len(clusters),
         "clusters": [c["name"] for c in clusters],
+        "schedule": args.schedule,
         "reuse_infra": args.reuse_infra,
         "max_steps": args.max_steps,
         "num_problems": len(results),
@@ -388,15 +412,27 @@ def print_report(summary, run_dir):
 # Orchestration
 # --------------------------------------------------------------------------- #
 async def run(args, clusters, problems, run_dir):
-    queue: asyncio.Queue = asyncio.Queue()
-    for p in problems:
-        queue.put_nowait(p)
     results: list = []
     state = {"total": len(problems), "started": 0, "done": 0}
 
+    if args.schedule == "static":
+        # Each cluster gets its own queue holding a fixed contiguous shard.
+        queues = []
+        for shard in shard_problems(problems, len(clusters)):
+            q: asyncio.Queue = asyncio.Queue()
+            for p in shard:
+                q.put_nowait(p)
+            queues.append(q)
+    else:
+        # One shared queue; every worker pulls the next problem when it frees up.
+        shared: asyncio.Queue = asyncio.Queue()
+        for p in problems:
+            shared.put_nowait(p)
+        queues = [shared for _ in clusters]
+
     workers = [
-        asyncio.create_task(worker(c, queue, results, args, run_dir, state))
-        for c in clusters
+        asyncio.create_task(worker(c, queues[i], results, args, run_dir, state))
+        for i, c in enumerate(clusters)
     ]
     try:
         await asyncio.gather(*workers)
@@ -438,6 +474,10 @@ def main():
                         help="Timeout for shared-infra setup/teardown (default: 900).")
     parser.add_argument("--retries", type=int, default=1,
                         help="Retries for a failed/timed-out problem (default: 1).")
+    parser.add_argument("--schedule", choices=["queue", "static"], default="queue",
+                        help="queue (default): shared dynamic queue, any cluster runs any "
+                             "problem as it frees up (best throughput). static: contiguous "
+                             "fixed shards -- cluster i runs its own slice (e.g. 1-25, 26-50).")
     parser.add_argument("--clusters", default=None,
                         help="Explicit comma-separated cluster names (overrides --workers).")
     parser.add_argument("--cluster-prefix", default="aiops",
@@ -474,17 +514,30 @@ def main():
 
     log(f"[bold]AIOpsLab parallel runner[/]" if _console else "AIOpsLab parallel runner")
     log(f"  agent={args.agent}  workers={len(clusters)}  problems={len(problems)}  "
-        f"max_steps={args.max_steps}  reuse_infra={args.reuse_infra}")
+        f"max_steps={args.max_steps}  reuse_infra={args.reuse_infra}  schedule={args.schedule}")
     log(f"  clusters: {', '.join(c['name'] for c in clusters)}")
     log(f"  results:  {run_dir}")
 
     if args.dry_run:
         log("\n[bold yellow]DRY RUN[/] — no clusters touched. Schedule:" if _console
             else "\nDRY RUN — no clusters touched. Schedule:")
-        for i, p in enumerate(problems):
-            log(f"  {i+1:>3}. {p}   (→ {clusters[i % len(clusters)]['name']} if idle)")
-        log(f"\n{len(problems)} problems across {len(clusters)} workers "
-            f"(dynamic queue; assignment above is illustrative).")
+        if args.schedule == "static":
+            for c, shard in zip(clusters, shard_problems(problems, len(clusters))):
+                if shard:
+                    log(f"\n  [bold]{c['name']}[/] — {len(shard)} problems "
+                        f"({shard[0]} … {shard[-1]}):" if _console
+                        else f"\n  {c['name']} — {len(shard)} problems:")
+                    for j, p in enumerate(shard, 1):
+                        log(f"      {j:>3}. {p}")
+                else:
+                    log(f"\n  [bold]{c['name']}[/] — (no problems)" if _console
+                        else f"\n  {c['name']} — (no problems)")
+            log(f"\n{len(problems)} problems across {len(clusters)} workers (static shards).")
+        else:
+            for i, p in enumerate(problems):
+                log(f"  {i+1:>3}. {p}")
+            log(f"\n{len(problems)} problems across {len(clusters)} workers "
+                f"(dynamic queue; any cluster runs the next problem when idle).")
         return
 
     preflight(clusters, args)

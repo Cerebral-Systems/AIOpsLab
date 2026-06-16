@@ -83,6 +83,34 @@ Other flags: `--retries N` (default 1), `--timeout SECONDS` per problem (default
 
 Make sure API keys are set (`.env`) for the agent you choose.
 
+### Scheduling: dynamic queue (default) vs static shards
+
+By default (`--schedule queue`) all workers pull from **one shared queue** — any
+cluster runs whatever problem is next when it goes idle. This maximizes
+throughput: a cluster that draws fast problems just grabs more, so no worker sits
+idle while another grinds through slow problems.
+
+Use `--schedule static` to instead assign **fixed contiguous shards**, one per
+cluster — e.g. with 50 problems and 2 clusters, `aiops-0` runs problems 1–25 and
+`aiops-1` runs 26–50:
+
+```bash
+python scripts/parallel/run_parallel.py \
+    --clusters aiops-0,aiops-1 --problems all --schedule static --dry-run
+```
+
+The `--dry-run` prints the exact per-cluster assignment so you can confirm it.
+Extra problems when the count doesn't divide evenly go to the earliest clusters
+(60 problems / 4 clusters → 15, 15, 15, 15; 58 → 15, 15, 14, 14).
+
+| Mode | When to use |
+|------|-------------|
+| `queue` (default) | Fastest wall-clock; problem durations vary a lot. |
+| `static` | Deterministic, reproducible cluster→problem mapping (debugging, pinning a noisy app to one cluster, isolating a subset per cluster). Note: a cluster whose shard holds the slow problems can finish later than the others. |
+
+> Either mode works with `--reuse-infra`. In `static` mode, a cluster whose shard
+> is empty (more clusters than problems) skips infra setup/teardown entirely.
+
 ---
 
 ## 3. Results
