@@ -22,11 +22,19 @@ class KubeCtl:
 
         # For kind clusters, support parallel execution via AIOPSLAB_CLUSTER env var.
         # For remote clusters (k8s_host is an IP/hostname), use the default kubeconfig context.
+        #
+        # Parallel-execution note: raw `kubectl`/`helm` shell-outs in this codebase do
+        # NOT pass --context, so they follow whatever KUBECONFIG points at. To keep the
+        # Python client (below) in agreement with those shell-outs, when a worker-scoped
+        # KUBECONFIG is provided we trust its current-context instead of forcing one here.
         k8s_host = app_config.get("k8s_host", "kind")
         cluster_env = os.environ.get('AIOPSLAB_CLUSTER')
+        kubeconfig_env = os.environ.get('KUBECONFIG')
 
         if cluster_env:
             context = f"kind-{cluster_env}"
+        elif kubeconfig_env:
+            context = None  # use the worker-scoped kubeconfig's current-context
         elif k8s_host == "kind":
             context = "kind-kind"
         else:

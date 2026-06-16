@@ -30,6 +30,7 @@ class Orchestrator:
         self.kubectl = KubeCtl()
         self.use_wandb = os.getenv("USE_WANDB", "false").lower() == "true"
         self.results_dir = results_dir
+        self.prometheus = None
 
     def init_problem(self, problem_id: str):
         """Initialize a problem instance for the agent to solve.
@@ -51,21 +52,18 @@ class Orchestrator:
         self.session.set_agent(self.agent_name)
 
         if deployment != "docker":
-            print("Setting up OpenEBS...")
+            # Prometheus is referenced again at teardown, so make sure it exists
+            # even when we skip (re)deploying the shared infra.
+            if self.prometheus is None:
+                self.prometheus = Prometheus()
 
-            # Install OpenEBS
-            self.kubectl.exec_command(
-                "kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml"
-            )
-            self.kubectl.exec_command(
-                "kubectl patch storageclass openebs-hostpath -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
-            )
-            self.kubectl.wait_for_ready("openebs")
-            print("OpenEBS setup completed.")
-
-            # Setup and deploy Prometheus
-            self.prometheus = Prometheus()
-            self.prometheus.deploy()
+            if os.getenv("AIOPSLAB_SKIP_INFRA_SETUP", "false").lower() == "true":
+                print(
+                    "AIOPSLAB_SKIP_INFRA_SETUP=true: assuming OpenEBS + Prometheus "
+                    "are already installed on this cluster."
+                )
+            else:
+                self.setup_cluster_infra()
 
         # deploy service
         prob.app.delete()
@@ -99,6 +97,42 @@ class Orchestrator:
         """
         self.agent = agent
         self.agent_name = name
+
+    def setup_cluster_infra(self):
+        """Install cluster-global infra (OpenEBS + Prometheus) on the active cluster.
+
+        Idempotent. Canonical source of the shared-infra bootstrap; also invoked
+        out-of-band by the parallel runner's `--reuse-infra` mode so the infra is
+        installed once per cluster instead of per problem.
+        """
+        print("Setting up OpenEBS...")
+        self.kubectl.exec_command(
+            "kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml"
+        )
+        self.kubectl.exec_command(
+            "kubectl patch storageclass openebs-hostpath -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
+        )
+        self.kubectl.wait_for_ready("openebs")
+        print("OpenEBS setup completed.")
+
+        # Setup and deploy Prometheus
+        if self.prometheus is None:
+            self.prometheus = Prometheus()
+        self.prometheus.deploy()
+
+    def teardown_cluster_infra(self):
+        """Uninstall cluster-global infra (OpenEBS + Prometheus) from the active cluster."""
+        if self.prometheus is None:
+            self.prometheus = Prometheus()
+        self.prometheus.teardown()
+        print("Uninstalling OpenEBS...")
+        self.kubectl.exec_command(
+            "kubectl delete sc openebs-hostpath openebs-device --ignore-not-found"
+        )
+        self.kubectl.exec_command(
+            "kubectl delete -f https://openebs.github.io/charts/openebs-operator.yaml"
+        )
+        self.kubectl.wait_for_namespace_deletion("openebs")
 
     async def ask_agent(self, input):
         """Ask the agent for the next action given the current context."""
@@ -203,15 +237,15 @@ class Orchestrator:
         # But this will take more time.
         # if not self.session.problem.sys_status_after_recovery():
         self.session.problem.app.cleanup()
-        
+
         if self.session.problem.namespace != "docker":
-            self.prometheus.teardown()
-            print("Uninstalling OpenEBS...")
-            self.kubectl.exec_command("kubectl delete sc openebs-hostpath openebs-device --ignore-not-found")
-            self.kubectl.exec_command(
-                "kubectl delete -f https://openebs.github.io/charts/openebs-operator.yaml"
-            )
-            self.kubectl.wait_for_namespace_deletion("openebs")
+            if os.getenv("AIOPSLAB_SKIP_INFRA_TEARDOWN", "false").lower() == "true":
+                print(
+                    "AIOPSLAB_SKIP_INFRA_TEARDOWN=true: leaving OpenEBS + Prometheus "
+                    "in place for reuse by subsequent problems."
+                )
+            else:
+                self.teardown_cluster_infra()
 
         self.execution_end_time = time.time()
         total_execution_time = self.execution_end_time - self.execution_start_time
