@@ -187,13 +187,13 @@ class VirtualizationFaultInjector(FaultInjector):
     def inject_model_misconfig(self, microservices: list[str]):
         """Inject a fault to misconfigure the model in the Flower application."""
         for service in microservices:
-            command = f""" docker exec -it {service} sh -c "sed -i '24s/84/80/' /app/.flwr/apps/*/task.py" """
+            command = f""" docker exec {service} sh -c "sed -i '24s/84/80/' /app/.flwr/apps/*/task.py" """
             self.docker.exec_command(command)
             print(f"Changed model configuration for service: {service}")
             
     def recover_model_misconfig(self, microservices: list[str]):
         for service in microservices:
-            command = f""" docker exec -it {service} sh -c "sed -i '24s/80/84/' /app/.flwr/apps/*/task.py" """
+            command = f""" docker exec {service} sh -c "sed -i '24s/80/84/' /app/.flwr/apps/*/task.py" """
             self.docker.exec_command(command)
             print(f"Recovered model configuration for service: {service}")
             
